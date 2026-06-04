@@ -133,6 +133,17 @@ struct Settings {
     // plane uncertainty. The resulting sigma is used to weight QEM evidence
     // and to make seed/parent/mesh gates scale-aware instead of purely fixed.
     bool   enable_probabilistic_planes = true;
+    // Probabilistic Quadrics (Trettner & Kobbelt 2020): model the surface NORMAL
+    // as uncertain and add its covariance to the QEM quadric, A += w(n n^T + Sigma_n)
+    // with Sigma_n = sigma_n^2 (I - n n^T). This makes the per-observation matrix
+    // interpolate between point-to-plane (confident normal -> rank-1 n n^T) and
+    // point-to-point (uncertain normal -> ~I), self-regularizes A at corners /
+    // edges / sparse cells, and down-weights observations with poorly estimated
+    // normals. Disabled by default so it can be A/B'd against the scalar weight.
+    bool   enable_probabilistic_quadrics = false;
+    double prob_quadric_normal_sigma = 0.05; // base normal angular std (rad) at full confidence
+    double prob_quadric_conf_floor   = 0.20; // confidence floor used when scaling sigma_n
+    double prob_quadric_max_sigma    = 0.40; // cap on normal angular std (rad)
     double bearing_sigma_rad      = 0.0015; // LiDAR bearing std-dev, radians
     double pose_trans_sigma       = 0.02;   // fallback pose translation std-dev, m
     double pose_rot_sigma_rad     = 0.002;  // fallback pose rotation std-dev, radians
@@ -1045,15 +1056,28 @@ struct VoxelCell {
                  bool scan_boundary=false, bool ray_normal_fallback=false,
                  double eogm_surface_reliability=-1.0,
                  const Mat3* point_cov_world=nullptr,
-                 double conf_w=-1.0) {
+                 double conf_w=-1.0,
+                 const Mat3* normal_cov_world=nullptr) {
         // n is assumed unit. add_plane(s, n, w) in QEM terms.
         // w     = geometry/QEM weight (may be floored so weak hits still nudge x)
         // conf_w = confidence weight (un-floored); drives eligibility/EOGM mass.
+        // normal_cov_world (optional) = Sigma_n; when present the per-observation
+        // matrix becomes M = n n^T + Sigma_n (Probabilistic Quadrics). With
+        // Sigma_n=0 this reduces exactly to standard point-to-plane QEM:
+        //   M = n n^T, M s = (n.s) n, s^T M s = (n.s)^2.
         if (conf_w < 0.0) conf_w = w;
         const double n_dot_s = n.dot(s);
-        A.noalias() += w * (n * n.transpose());
-        b.noalias() += (w * n_dot_s) * n;
-        c           += w * n_dot_s * n_dot_s;
+        if (normal_cov_world) {
+            Mat3 M = n * n.transpose() + *normal_cov_world;
+            Vec3 Ms = M * s;
+            A.noalias() += w * M;
+            b.noalias() += w * Ms;
+            c           += w * s.dot(Ms);
+        } else {
+            A.noalias() += w * (n * n.transpose());
+            b.noalias() += (w * n_dot_s) * n;
+            c           += w * n_dot_s * n_dot_s;
+        }
         weight_sum  += w;
         // Mean normal / normal-consistency use the confidence weight so the mesh
         // normal is dominated by confident observations, while the QEM position
@@ -3868,10 +3892,27 @@ public:
                 // ray-normal points cannot pollute its center/covariance.
                 bool feed_prob_plane = s.enable_probabilistic_planes &&
                     (!s.soft_uncertainty_weighting || conf_weights[i] >= s.soft_prob_plane_min_weight);
+                // Probabilistic Quadrics: build the normal covariance Sigma_n in
+                // the tangent plane of n, scaled up when the normal estimate is
+                // less confident (low NVT/PCA confidence -> larger angular sigma).
+                Mat3 Sigma_n;
+                const Mat3* Sn_ptr = nullptr;
+                if (s.enable_probabilistic_quadrics) {
+                    double nc = std::clamp(normal_conf[i], s.nvt_min_conf, 1.0);
+                    double cfloor = std::clamp(s.nvt_conf_soft_floor, 0.0, 1.0);
+                    double nc_soft = cfloor + (1.0 - cfloor) * nc;
+                    double sig = s.prob_quadric_normal_sigma /
+                                 std::sqrt(std::clamp(nc_soft, s.prob_quadric_conf_floor, 1.0));
+                    sig = std::min(sig, s.prob_quadric_max_sigma);
+                    double sig2 = sig * sig;
+                    const Vec3& nn = nrm_g[i];
+                    Sigma_n = sig2 * (Mat3::Identity() - nn * nn.transpose());
+                    Sn_ptr = &Sigma_n;
+                }
                 local[hit_ijk].add_hit(pts_g[i], nrm_g[i], weights[i], scan_idx, scan_boundary, false,
                                        eogm_hit_reliability(conf_weights[i], false, scan_boundary, false),
                                        feed_prob_plane ? &point_cov_w[i] : nullptr,
-                                       conf_weights[i]);
+                                       conf_weights[i], Sn_ptr);
                 if (s.carve_rays) {
                     // Confidence-scaled ray carving: weak/low-confidence endpoints
                     // carve free space weakly or not at all, so they cannot
@@ -8000,6 +8041,10 @@ static void print_usage() {
 "    --voxel_size F           voxel edge length, metres (default 0.1)\n"
 "    --range_precision F      sigma_range, metres (default 0.015)\n"
 "    --disable_prob_planes   disable probabilistic plane covariance/gates\n"
+"    --enable_probabilistic_quadrics  add normal-uncertainty term to the QEM quadric (Probabilistic Quadrics; default off)\n"
+"    --prob_quadric_normal_sigma F    base normal angular std in rad at full confidence (default 0.05)\n"
+"    --prob_quadric_conf_floor F      confidence floor used when scaling sigma_n (default 0.20)\n"
+"    --prob_quadric_max_sigma F       cap on normal angular std in rad (default 0.40)\n"
 "    --bearing_sigma_rad F   LiDAR bearing std-dev in radians (default 0.0015)\n"
 "    --pose_trans_sigma F    fallback pose translation std-dev, metres (default 0.02)\n"
 "    --pose_rot_sigma_rad F  fallback pose rotation std-dev, radians (default 0.002)\n"
@@ -8276,6 +8321,11 @@ int main(int argc, char** argv) {
         else if (arg == "--voxel_size")           settings.voxel_size           = argv_util::next_double(arg);
         else if (arg == "--range_precision")      settings.range_precision      = argv_util::next_double(arg);
         else if (arg == "--disable_prob_planes") settings.enable_probabilistic_planes = false;
+        else if (arg == "--enable_probabilistic_quadrics")  settings.enable_probabilistic_quadrics = true;
+        else if (arg == "--disable_probabilistic_quadrics") settings.enable_probabilistic_quadrics = false;
+        else if (arg == "--prob_quadric_normal_sigma") settings.prob_quadric_normal_sigma = argv_util::next_double(arg);
+        else if (arg == "--prob_quadric_conf_floor")   settings.prob_quadric_conf_floor   = argv_util::next_double(arg);
+        else if (arg == "--prob_quadric_max_sigma")    settings.prob_quadric_max_sigma    = argv_util::next_double(arg);
         else if (arg == "--bearing_sigma_rad")   settings.bearing_sigma_rad   = argv_util::next_double(arg);
         else if (arg == "--pose_trans_sigma")    settings.pose_trans_sigma    = argv_util::next_double(arg);
         else if (arg == "--pose_rot_sigma_rad")  settings.pose_rot_sigma_rad  = argv_util::next_double(arg);
@@ -8699,6 +8749,10 @@ int main(int argc, char** argv) {
                 settings.bearing_sigma_rad, settings.pose_trans_sigma, settings.pose_rot_sigma_rad,
                 settings.prob_gate_sigma, settings.prob_min_sigma, settings.prob_max_sigma,
                 settings.prob_qem_ref_sigma);
+    std::printf("  Probabilistic quadrics: %s  normal_sigma=%.3frad conf_floor=%.2f max_sigma=%.3frad  (A += w(nn^T + Sigma_n))\n",
+                settings.enable_probabilistic_quadrics ? "on" : "off",
+                settings.prob_quadric_normal_sigma, settings.prob_quadric_conf_floor,
+                settings.prob_quadric_max_sigma);
     std::printf("  Seed voxels: %s min_incident=%.2f weight_scale=%.2f promote_hits=%d neigh_promote_hits=%d export=%s\n",
                 settings.enable_seed_voxels ? "on" : "off",
                 settings.seed_min_incident_cos, settings.seed_hit_weight_scale,
