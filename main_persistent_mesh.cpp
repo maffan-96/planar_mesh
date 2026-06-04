@@ -363,6 +363,12 @@ struct Settings {
     // single live mesh would close them.
     bool        enable_seam_closing = true;
     int         seam_close_iters    = 2;     // cascade passes (a closed triangle can expose the next)
+    // Retire persistent faces whose interior (centroid / edge midpoints /
+    // interior samples) crosses observed FREE / high-conflict space, even when
+    // all three vertex cells are still valid. Catches stale "bridge" triangles
+    // spanning a doorway/window that vertex-aliveness alone cannot detect. Also
+    // vetoes such triangles during seam closing.
+    bool        persistent_retire_free_faces = true;
     // Sparse-region scaffold structuring. Where raw LiDAR points are too sparse
     // to fill voxels at the working resolution, inherit a coarse-level QEM plane
     // / normal / evidence into the empty fine voxels ("virtual inherited points")
@@ -3241,9 +3247,9 @@ public:
         return true;
     }
 
-    void clear_hierarchical_scaffold_inheritance() {
+    void clear_hierarchical_scaffold_inheritance(bool mark_dirty = true) {
         for (const VoxKey& k : scaffold_inherited_keys) {
-            mark_component_dirty(k);
+            if (mark_dirty) mark_component_dirty(k);
             auto it = cells.find(k);
             if (it != cells.end()) it->second.clear_inherited();
         }
@@ -3252,10 +3258,18 @@ public:
 
     long rebuild_hierarchical_scaffold_inheritance(int scan_idx) {
         if (!hierarchical_scaffold_enabled()) {
-            clear_hierarchical_scaffold_inheritance();
+            // Scaffold turned off: virtual support vanishes everywhere, so dirty
+            // those cells once to let the persistent mesher retire their faces.
+            clear_hierarchical_scaffold_inheritance(/*mark_dirty=*/true);
             return 0;
         }
-        clear_hierarchical_scaffold_inheritance();
+        // Refreshing virtual priors must NOT, by itself, dirty the whole scaffold
+        // every scan -- that would defeat the active-parent gate below and churn
+        // the incremental mesh. Clear silently, remember the previous keys, and
+        // dirty selectively: active-parent children (in the build loop) and any
+        // cell whose inherited support disappeared (handled after the rebuild).
+        std::unordered_set<VoxKey, VoxHash> old_inherited_keys = scaffold_inherited_keys;
+        clear_hierarchical_scaffold_inheritance(/*mark_dirty=*/false);
         long total_children = 0;
         int max_level = std::clamp(s.scaffold_max_level, 1, 6);
         double base_weight = std::max(1e-12, s.scaffold_inherit_weight);
@@ -3322,6 +3336,12 @@ public:
                             level, factor, level_parents, level_children, w);
             }
         }
+        // Retire-side dirtying: any cell that had inherited support last scan but
+        // does not anymore (parent dropped, plane no longer crosses it, etc.)
+        // must be re-meshed so its now-unsupported faces can be dropped.
+        for (const VoxKey& k : old_inherited_keys)
+            if (scaffold_inherited_keys.find(k) == scaffold_inherited_keys.end())
+                mark_component_dirty(k);
         return total_children;
     }
 
@@ -6992,7 +7012,8 @@ public:
         // Grow the halo so seam triangles reconnect to clean neighbors.
         const int halo = persistent_mesh_halo();
         std::unordered_set<VoxKey, VoxHash> region;
-        region.reserve(dirty.size() * (size_t)((2 * halo + 1)));
+        const size_t side = (size_t)(2 * halo + 1);
+        region.reserve(dirty.size() * side * side * side);
         for (const VoxKey& k : dirty) {
             for (int dx = -halo; dx <= halo; ++dx)
             for (int dy = -halo; dy <= halo; ++dy)
@@ -7077,7 +7098,9 @@ public:
             const VoxKey& kb = persistent_mesh_.verts[f.b].key;
             const VoxKey& kc = persistent_mesh_.verts[f.c].key;
             if (is_dirty(ka) || is_dirty(kb) || is_dirty(kc)) continue; // handled in passes (2)/(3)
-            if (!alive(ka) || !alive(kb) || !alive(kc)) { retired++; continue; } // contradicted -> delete
+            if (!alive(ka) || !alive(kb) || !alive(kc)) { retired++; continue; } // vertex cell contradicted
+            if (s.persistent_retire_free_faces &&
+                component_face_free_space_contradicted(persistent_mesh_, f)) { retired++; continue; } // interior crosses free space
             if (add_face(ka, kb, kc)) kept++;
         }
         // (2) Freshly meshed faces that touch the dirty region (authoritative for
@@ -7098,7 +7121,9 @@ public:
             const VoxKey& kb = persistent_mesh_.verts[f.b].key;
             const VoxKey& kc = persistent_mesh_.verts[f.c].key;
             if (!(is_dirty(ka) || is_dirty(kb) || is_dirty(kc))) continue; // only the dirty ones here
-            if (!alive(ka) || !alive(kb) || !alive(kc)) { retired++; continue; } // contradicted -> delete
+            if (!alive(ka) || !alive(kb) || !alive(kc)) { retired++; continue; } // vertex cell contradicted
+            if (s.persistent_retire_free_faces &&
+                component_face_free_space_contradicted(persistent_mesh_, f)) { retired++; continue; } // interior crosses free space
             if (add_face(ka, kb, kc)) retained_dirty++;
         }
 
@@ -7107,7 +7132,7 @@ public:
 
         // Seam-aware hole closing across the persistent<->local boundary.
         size_t seam_closed = 0;
-        if (s.enable_seam_closing) seam_closed = close_seam_holes(persistent_mesh_, region);
+        if (s.enable_seam_closing) seam_closed = close_seam_holes(persistent_mesh_, region, dirty);
 
         std::printf("  [persistent_mesh] update #%ld: dirty=%zu region=%zu halo=%d "
                     "local(v=%zu,f=%zu) kept_clean=%zu remeshed=%zu retained_dirty=%zu retired=%zu "
@@ -7129,9 +7154,17 @@ public:
     // closed when both of its edges still have a free face slot, so this can fill
     // holes but never create a non-manifold seam. Cascaded over a few iterations
     // because closing one triangle can expose the next gap.
+    //
+    // To avoid patching ordinary interior holes inside the local remesh, a gap
+    // is only closed when its triangle straddles the actual seam: it must mix at
+    // least one vertex from a freshly re-meshed (dirty) cell with at least one
+    // from the retained clean mesh. Triangles whose interior crosses observed
+    // free space are vetoed as well.
     size_t close_seam_holes(MeshData& mesh,
-                            const std::unordered_set<VoxKey, VoxHash>& region) const {
+                            const std::unordered_set<VoxKey, VoxHash>& region,
+                            const std::unordered_set<VoxKey, VoxHash>& dirty) const {
         if (mesh.verts.size() < 3 || mesh.faces.empty()) return 0;
+        auto is_dirty = [&](const VoxKey& k) { return dirty.find(k) != dirty.end(); };
         const double max_edge = std::max(s.mesh_max_edge_factor, s.cdp_max_edge_factor) * s.voxel_size;
         const double max_fan_angle = std::clamp(s.mesh_max_fan_angle, 0.1, 6.283185307179586);
         const int iters = std::max(1, s.seam_close_iters);
@@ -7199,11 +7232,25 @@ public:
                     if (t + 1 == K) gap += 6.283185307179586;
                     if (gap > max_fan_angle) continue;
 
+                    // Seam-only: the triangle must straddle the dirty/clean
+                    // boundary -- at least one re-meshed (dirty) vertex AND at
+                    // least one retained clean vertex -- otherwise it is an
+                    // ordinary interior hole the local mesher already judged.
+                    {
+                        bool any_dirty = is_dirty(mesh.verts[vi].key) || is_dirty(mesh.verts[j].key) || is_dirty(mesh.verts[k].key);
+                        bool any_clean = !is_dirty(mesh.verts[vi].key) || !is_dirty(mesh.verts[j].key) || !is_dirty(mesh.verts[k].key);
+                        if (!(any_dirty && any_clean)) continue;
+                    }
+
                     // Geometry / QEM gates (reuse the smooth mesher's triangle test).
                     if ((mesh.verts[vi].position - mesh.verts[j].position).norm() > max_edge) continue;
                     if ((mesh.verts[vi].position - mesh.verts[k].position).norm() > max_edge) continue;
                     if ((mesh.verts[j].position  - mesh.verts[k].position).norm() > max_edge) continue;
                     if (!mesh_triangle_ok(mesh.verts[vi], mesh.verts[j], mesh.verts[k])) continue;
+
+                    // Do not bridge across observed free space.
+                    if (s.persistent_retire_free_faces &&
+                        component_face_free_space_contradicted(mesh, MeshFace{vi, j, k})) continue;
 
                     // Manifold guard: only close if both bridged edges have a slot.
                     if (!triangle_edges_can_accept(edge_count, vi, j, k)) continue;
@@ -7868,6 +7915,8 @@ static void print_usage() {
 "    --disable_seam_closing      do not run the seam-aware hole-closing pass after each incremental splice\n"
 "    --enable_seam_closing       close holes across the persistent<->local seam (default on)\n"
 "    --seam_close_iters N        cascade passes for seam hole closing (default 2)\n"
+"    --disable_persistent_retire_free_faces   keep persistent faces even if their interior crosses observed free space\n"
+"    --enable_persistent_retire_free_faces    retire persistent/seam faces whose centroid/edges cross FREE space (default on)\n"
 "    --disable_sparse_scaffold   do not inherit virtual QEM/evidence into sparse voxels (manage --scaffold_* manually)\n"
 "    --enable_sparse_scaffold    scaffold sparse regions with inherited coarse-level QEM planes (default on)\n"
 "                              smooth         = local fan triangulation on smooth patches\n"
@@ -8071,6 +8120,8 @@ int main(int argc, char** argv) {
         else if (arg == "--enable_seam_closing")  settings.enable_seam_closing = true;
         else if (arg == "--disable_seam_closing") settings.enable_seam_closing = false;
         else if (arg == "--seam_close_iters")     settings.seam_close_iters     = argv_util::next_int(arg);
+        else if (arg == "--enable_persistent_retire_free_faces")  settings.persistent_retire_free_faces = true;
+        else if (arg == "--disable_persistent_retire_free_faces") settings.persistent_retire_free_faces = false;
         else if (arg == "--enable_sparse_scaffold")  settings.sparse_region_scaffold = true;
         else if (arg == "--disable_sparse_scaffold") settings.sparse_region_scaffold = false;
         else if (arg == "--dc_require_free")      settings.dc_require_free      = true;
@@ -8380,8 +8431,9 @@ int main(int argc, char** argv) {
     std::printf("  Persistent incremental mesh: %s  halo_voxels=%s\n",
                 settings.persistent_incremental_mesh ? "on (remesh dirty regions only)" : "off (full rebuild each export)",
                 halo_desc.c_str());
-    std::printf("  Seam-aware hole closing: %s  iters=%d\n",
-                settings.enable_seam_closing ? "on" : "off", settings.seam_close_iters);
+    std::printf("  Seam-aware hole closing: %s  iters=%d  retire_free_faces=%s\n",
+                settings.enable_seam_closing ? "on" : "off", settings.seam_close_iters,
+                settings.persistent_retire_free_faces ? "on" : "off");
     std::printf("  Sparse-region scaffold: %s  (virtual inherited QEM/evidence into sparse voxels, max_level=%d)\n",
                 settings.sparse_region_scaffold ? "on" : "off", settings.scaffold_max_level);
     std::printf("  Component growth: %s iters=%d edge=%.2f radius=%.2f/%.2f normal_dot=%.2f comp_dot=%.2f plane=%.2f confirmed_anchor=%s persistent=%s dirty_only=%s dirty_rad=%d search=%s\n",
