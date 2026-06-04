@@ -7207,18 +7207,25 @@ public:
             mesh = build_local_smooth_mesh(min_last_hit_scan, max_last_hit_scan);
         }
 
-        // Sparse-region scaffold fill for modes that do not run it internally.
-        // corner_dc_plus / hybrid / component_growth already invoke the fill pass
-        // inside build_corner_dc_plus_mesh; the remaining modes (smooth, dual,
-        // corner_dc, surface_net) need it appended so inherited (virtual) vertices
-        // in sparse regions get tiled into faces regardless of the chosen mode.
-        const bool mode_runs_fill_internally =
+        // corner_dc_plus / hybrid / component_growth already run the scaffold
+        // fill and (when enabled) the component-growth pipeline internally via
+        // build_corner_dc_plus_mesh. For the remaining modes (smooth, dual,
+        // corner_dc, surface_net) append the same two passes here so inherited
+        // (virtual) scaffold vertices get tiled AND --enable_component_growth
+        // works on top of any base mesher, not just corner_dc_plus.
+        const bool mode_runs_passes_internally =
             (mode == "corner_dc_plus" || mode == "cornerdc_plus" || mode == "corner_plus" || mode == "cdp" ||
              mode == "component_growth" || mode == "component_grow" || mode == "grow" || mode == "hybrid");
-        if (hierarchical_scaffold_fill_enabled() && !mode_runs_fill_internally && mesh.verts.size() >= 1) {
+        if (!mode_runs_passes_internally && mesh.verts.size() >= 1) {
             std::unordered_set<FaceKey, FaceKeyHash> fset;
             rebuild_face_set_from_mesh(mesh, fset);
-            apply_hierarchical_scaffold_fill_pass(mesh, fset);
+            if (hierarchical_scaffold_fill_enabled())
+                apply_hierarchical_scaffold_fill_pass(mesh, fset);
+            if (s.enable_component_growth) {
+                // force=true: run the boundary QEM grow pass even though this base
+                // mode did not invoke the refinement pipeline.
+                apply_component_growth_pass(mesh, fset, true);
+            }
         }
         return mesh;
     }
