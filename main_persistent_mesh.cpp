@@ -166,6 +166,13 @@ struct Settings {
     double soft_carve_skip_weight = 0.03;  // below this confidence, do not carve at all
     double soft_miss_weight_scale = 0.10;  // reduced-carve multiplier for weak hits
     double soft_ray_normal_weight = 0.005; // cap on confidence for ray-direction fallback normals
+    // Below this per-scan confidence in a cell, do not mark it dirty / do not
+    // activate its scaffold parent. Stops tiny-confidence grazing returns from
+    // forcing local remesh + scaffold recomputation churn.
+    double soft_dirty_min_weight  = 0.02;
+    // Below this confidence, an observation does not feed the probabilistic
+    // plane fit (so near-tangent / ray-normal points cannot pollute it).
+    double soft_prob_plane_min_weight = 0.03;
     int    process_every_n       = 2;       // subsample factor per scan
     int    estimate_normals_k    = 20;      // k for PCA fallback
     bool   orient_to_sensor      = true;    // flip normals to face sensor
@@ -1048,8 +1055,11 @@ struct VoxelCell {
         b.noalias() += (w * n_dot_s) * n;
         c           += w * n_dot_s * n_dot_s;
         weight_sum  += w;
-        normal_sum.noalias() += w * n;
-        normal_weight += w;
+        // Mean normal / normal-consistency use the confidence weight so the mesh
+        // normal is dominated by confident observations, while the QEM position
+        // (A,b,c) above still benefits from every (floored) observation.
+        normal_sum.noalias() += conf_w * n;
+        normal_weight += conf_w;
         hit_count++;
         hit_weight += conf_w;
         if (scan_boundary) { boundary_hit_count++; boundary_weight += conf_w; }
@@ -1114,9 +1124,13 @@ struct VoxelCell {
 
     double inherited_decay_scale() const {
         if (!has_inherited()) return 0.0;
-        if (weight_sum <= 1e-12 || hit_count <= 0) return 1.0;
+        // Use confidence-backed evidence (hit_weight), not the floored QEM
+        // geometry weight: weak/grazing soft hits should nudge geometry but must
+        // not prematurely erase the inherited scaffold prior in sparse regions.
+        const double real_conf = std::max(0.0, hit_weight);
+        if (real_conf <= 1e-12 || hit_count <= 0) return 1.0;
         double ref = inherited_decay_ref > 1e-12 ? inherited_decay_ref : std::max(weight_inherited, 1e-12);
-        return std::clamp(ref / (ref + std::max(0.0, weight_sum)), 0.0, 1.0);
+        return std::clamp(ref / (ref + real_conf), 0.0, 1.0);
     }
 
     Mat3   A_eff() const { return A + inherited_decay_scale() * A_inherited; }
@@ -3849,10 +3863,14 @@ public:
                 }
 
                 // Geometry uses weights[i] (floored); confidence/EOGM uses the
-                // un-floored conf_weights[i].
+                // un-floored conf_weights[i]. The probabilistic-plane fit is fed
+                // only by sufficiently confident observations so near-tangent /
+                // ray-normal points cannot pollute its center/covariance.
+                bool feed_prob_plane = s.enable_probabilistic_planes &&
+                    (!s.soft_uncertainty_weighting || conf_weights[i] >= s.soft_prob_plane_min_weight);
                 local[hit_ijk].add_hit(pts_g[i], nrm_g[i], weights[i], scan_idx, scan_boundary, false,
                                        eogm_hit_reliability(conf_weights[i], false, scan_boundary, false),
-                                       s.enable_probabilistic_planes ? &point_cov_w[i] : nullptr,
+                                       feed_prob_plane ? &point_cov_w[i] : nullptr,
                                        conf_weights[i]);
                 if (s.carve_rays) {
                     // Confidence-scaled ray carving: weak/low-confidence endpoints
@@ -3895,7 +3913,15 @@ public:
                 }
                 n_misses += v.miss_count;
                 n_hits   += v.hit_count;
-                if (v.hit_count > 0) { mark_component_dirty(k); this_scan_hit_keys.push_back(k); }
+                // Confidence-driven dirty marking: in soft mode a cell only marks
+                // a remesh region / activates its scaffold parent if it received
+                // enough confidence this scan (v.hit_weight is the confidence
+                // weight). Stops tiny-confidence grazing returns from churning the
+                // incremental mesh and scaffold every scan.
+                bool dirty_enough = s.soft_uncertainty_weighting
+                    ? (v.hit_weight >= s.soft_dirty_min_weight)
+                    : (v.hit_count > 0);
+                if (dirty_enough) { mark_component_dirty(k); this_scan_hit_keys.push_back(k); }
                 // Free-space carving (miss-only) does not grow the dirty set, but
                 // it may contradict existing persistent faces; flag a retirement
                 // sweep for the next mesh export.
@@ -7983,6 +8009,8 @@ static void print_usage() {
 "    --soft_carve_skip_weight F below this confidence, no ray carving (default 0.03)\n"
 "    --soft_miss_weight_scale F reduced-carve multiplier for weak hits (default 0.10)\n"
 "    --soft_ray_normal_weight F confidence cap for ray-direction fallback normals (default 0.005)\n"
+"    --soft_dirty_min_weight F  min per-scan cell confidence to mark dirty / activate scaffold (default 0.02)\n"
+"    --soft_prob_plane_min_weight F  min confidence to feed the probabilistic-plane fit (default 0.03)\n"
 "    --process_every_n N      input subsampling factor (default 2)\n"
 "    --estimate_normals_k N   k for PCA fallback (default 20)\n"
 "    --disable_nvt           disable NVT/BEO normal denoising\n"
@@ -8260,6 +8288,8 @@ int main(int argc, char** argv) {
         else if (arg == "--soft_carve_skip_weight") settings.soft_carve_skip_weight = argv_util::next_double(arg);
         else if (arg == "--soft_miss_weight_scale") settings.soft_miss_weight_scale = argv_util::next_double(arg);
         else if (arg == "--soft_ray_normal_weight") settings.soft_ray_normal_weight = argv_util::next_double(arg);
+        else if (arg == "--soft_dirty_min_weight")  settings.soft_dirty_min_weight  = argv_util::next_double(arg);
+        else if (arg == "--soft_prob_plane_min_weight") settings.soft_prob_plane_min_weight = argv_util::next_double(arg);
         else if (arg == "--process_every_n")      settings.process_every_n      = argv_util::next_int(arg);
         else if (arg == "--estimate_normals_k")   settings.estimate_normals_k   = argv_util::next_int(arg);
         else if (arg == "--disable_nvt")          settings.enable_nvt           = false;
@@ -8655,6 +8685,8 @@ int main(int argc, char** argv) {
                     settings.soft_carve_min_weight, settings.soft_carve_skip_weight,
                     settings.soft_carve_min_weight, settings.soft_miss_weight_scale,
                     settings.soft_carve_skip_weight, settings.soft_ray_normal_weight);
+        std::printf("  Soft confidence gates: dirty>=%.3f  prob_plane>=%.3f  (scaffold decay uses confidence)\n",
+                    settings.soft_dirty_min_weight, settings.soft_prob_plane_min_weight);
     std::printf("  Probabilistic planes: %s bearing_sigma=%.6f pose_trans_sigma=%.4f pose_rot_sigma=%.6f gate_sigma=%.2f sigma=[%.3f, %.3f] qem_ref=%.4f sample_cap=50\n",
                 settings.enable_probabilistic_planes ? "on" : "off",
                 settings.bearing_sigma_rad, settings.pose_trans_sigma, settings.pose_rot_sigma_rad,
