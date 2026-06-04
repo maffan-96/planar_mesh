@@ -154,7 +154,18 @@ struct Settings {
     // ones contribute less, but none are discarded. A small floor keeps even
     // near-tangent returns contributing a little rather than nothing.
     bool   soft_uncertainty_weighting = true;
-    double soft_weight_floor          = 0.02;   // minimum per-observation QEM weight (never 0 -> never rejected)
+    double soft_weight_floor          = 0.02;   // minimum per-observation QEM (geometry) weight (never 0 -> never rejected)
+    // Confidence semantics for soft mode. The geometry (QEM) weight is floored
+    // so weak observations still nudge the vertex, but CONFIDENCE quantities
+    // (hit_weight / vertex+scaffold eligibility / EOGM mass) use the UN-floored
+    // weight, so a weak return is not treated as strong evidence. Ray carving is
+    // also confidence-scaled: weak endpoints carve free space weakly or not at
+    // all, and ray-direction fallback normals (which are not real surface
+    // normals) are capped to a tiny weight and never carve.
+    double soft_carve_min_weight  = 0.10;  // below this confidence, carve at reduced strength
+    double soft_carve_skip_weight = 0.03;  // below this confidence, do not carve at all
+    double soft_miss_weight_scale = 0.10;  // reduced-carve multiplier for weak hits
+    double soft_ray_normal_weight = 0.005; // cap on confidence for ray-direction fallback normals
     int    process_every_n       = 2;       // subsample factor per scan
     int    estimate_normals_k    = 20;      // k for PCA fallback
     bool   orient_to_sensor      = true;    // flip normals to face sensor
@@ -1026,8 +1037,12 @@ struct VoxelCell {
     void add_hit(const Vec3& s, const Vec3& n, double w, int scan_idx,
                  bool scan_boundary=false, bool ray_normal_fallback=false,
                  double eogm_surface_reliability=-1.0,
-                 const Mat3* point_cov_world=nullptr) {
+                 const Mat3* point_cov_world=nullptr,
+                 double conf_w=-1.0) {
         // n is assumed unit. add_plane(s, n, w) in QEM terms.
+        // w     = geometry/QEM weight (may be floored so weak hits still nudge x)
+        // conf_w = confidence weight (un-floored); drives eligibility/EOGM mass.
+        if (conf_w < 0.0) conf_w = w;
         const double n_dot_s = n.dot(s);
         A.noalias() += w * (n * n.transpose());
         b.noalias() += (w * n_dot_s) * n;
@@ -1036,12 +1051,12 @@ struct VoxelCell {
         normal_sum.noalias() += w * n;
         normal_weight += w;
         hit_count++;
-        hit_weight += w;
-        if (scan_boundary) { boundary_hit_count++; boundary_weight += w; }
-        if (ray_normal_fallback) { ray_normal_hit_count++; ray_normal_weight += w; }
+        hit_weight += conf_w;
+        if (scan_boundary) { boundary_hit_count++; boundary_weight += conf_w; }
+        if (ray_normal_fallback) { ray_normal_hit_count++; ray_normal_weight += conf_w; }
         if (point_cov_world) prob_plane.add_point(s, *point_cov_world);
         if (eogm_surface_reliability < 0.0) {
-            eogm_surface_reliability = std::min(0.65, 1.0 - std::exp(-0.45 * std::max(0.0, w)));
+            eogm_surface_reliability = std::min(0.65, 1.0 - std::exp(-0.45 * std::max(0.0, conf_w)));
             if (scan_boundary) eogm_surface_reliability *= 0.5;
             if (ray_normal_fallback) eogm_surface_reliability *= 0.25;
         }
@@ -3198,6 +3213,10 @@ public:
     bool scaffold_source_cell_ok(const VoxelCell& c) const {
         if (c.label(s) != VoxelCell::Label::SURFACE) return false;
         if (c.confirmed_hit_count() < s.min_hit_count_vertex) return false;
+        // Under soft weighting, also require enough accumulated confidence, so a
+        // weak/grazing-only cell cannot seed a coarse scaffold parent and spread
+        // a low-confidence plane into its inherited children.
+        if (c.confirmed_hit_weight() < s.min_hit_weight_vertex) return false;
         if (c.weight_sum < 1e-12) return false;
         if (c.normal_consistency() < s.scaffold_min_normal_consistency) return false;
         if (s.enable_eogm) {
@@ -3648,7 +3667,8 @@ public:
 
         // 4. Per-point: compute ray dir and orient initial normals.
         std::vector<Vec3>   dirs(N);
-        std::vector<double> weights(N, 0.0);
+        std::vector<double> weights(N, 0.0);       // geometry/QEM weight (floored in soft mode)
+        std::vector<double> conf_weights(N, 0.0);   // confidence weight (un-floored)
         std::vector<char>   keep(N, 1);
         std::atomic<long>   n_grazing{0};
 
@@ -3724,10 +3744,19 @@ public:
             if (s.soft_uncertainty_weighting) {
                 // Uncertainty-weighted fusion: use every observation, weighted by
                 // confidence. No grazing rejection and no seed/hypothesis
-                // diversion -- low-confidence returns simply get a small weight
-                // and therefore move the QEM vertex/plane very little. The floor
-                // guarantees nothing is effectively discarded.
-                weights[i] = std::max(base_weight, s.soft_weight_floor);
+                // diversion. We keep TWO weights:
+                //  - confidence weight (un-floored): drives vertex/scaffold
+                //    eligibility, EOGM mass, and carve strength;
+                //  - geometry weight (floored): ensures even weak returns still
+                //    nudge the QEM vertex without being treated as confident.
+                // Ray-direction fallback normals are not real surface normals, so
+                // their confidence is capped tiny and their geometry is left
+                // un-floored (we do not amplify a bad normal).
+                bool ray_fallback = (normal_source[i] == 3);
+                double conf = base_weight;
+                if (ray_fallback) conf = std::min(conf, s.soft_ray_normal_weight);
+                conf_weights[i] = conf;
+                weights[i] = ray_fallback ? conf : std::max(conf, s.soft_weight_floor);
                 keep[i] = 1; // always a main-map confirmed hit
                 continue;
             }
@@ -3737,6 +3766,7 @@ public:
                 keep[i] = 2;
                 weights[i] = std::max(s.seed_min_hit_weight,
                                       base_weight * s.seed_hit_weight_scale);
+                conf_weights[i] = weights[i];
                 continue;
             }
             if (inc_cos < s.min_incident_cos) {
@@ -3748,6 +3778,7 @@ public:
                     keep[i] = 2; // seed/hypothesis hit, not a confirmed hit
                     weights[i] = std::max(s.seed_min_hit_weight,
                                           base_weight * s.seed_hit_weight_scale);
+                    conf_weights[i] = weights[i];
                 } else {
                     keep[i] = 0;
                     n_grazing.fetch_add(1, std::memory_order_relaxed);
@@ -3755,6 +3786,7 @@ public:
                 continue;
             }
             weights[i] = base_weight;
+            conf_weights[i] = base_weight;
         }
         n_grazing_total += n_grazing.load();
 
@@ -3816,14 +3848,32 @@ public:
                     continue;
                 }
 
+                // Geometry uses weights[i] (floored); confidence/EOGM uses the
+                // un-floored conf_weights[i].
                 local[hit_ijk].add_hit(pts_g[i], nrm_g[i], weights[i], scan_idx, scan_boundary, false,
-                                       eogm_hit_reliability(weights[i], false, scan_boundary, false),
-                                       s.enable_probabilistic_planes ? &point_cov_w[i] : nullptr);
+                                       eogm_hit_reliability(conf_weights[i], false, scan_boundary, false),
+                                       s.enable_probabilistic_planes ? &point_cov_w[i] : nullptr,
+                                       conf_weights[i]);
                 if (s.carve_rays) {
-                    traverse_ray(sensor_t, pts_g[i], ray_voxels);
-                    for (const VoxKey& vk : ray_voxels) {
-                        if (vk == hit_ijk) continue;
-                        local[vk].add_miss(weights[i], scan_idx, eogm_miss_reliability(weights[i], false));
+                    // Confidence-scaled ray carving: weak/low-confidence endpoints
+                    // carve free space weakly or not at all, so they cannot
+                    // aggressively erase real geometry.
+                    double cw = conf_weights[i];
+                    double miss_w = weights[i];
+                    bool do_carve = true;
+                    if (s.soft_uncertainty_weighting) {
+                        if (cw < s.soft_carve_skip_weight) do_carve = false;
+                        else {
+                            miss_w = cw;
+                            if (cw < s.soft_carve_min_weight) miss_w *= s.soft_miss_weight_scale;
+                        }
+                    }
+                    if (do_carve) {
+                        traverse_ray(sensor_t, pts_g[i], ray_voxels);
+                        for (const VoxKey& vk : ray_voxels) {
+                            if (vk == hit_ijk) continue;
+                            local[vk].add_miss(miss_w, scan_idx, eogm_miss_reliability(miss_w, false));
+                        }
                     }
                 }
             }
@@ -7929,6 +7979,10 @@ static void print_usage() {
 "    --enable_soft_uncertainty_weighting    use every observation, weighted by confidence/inverse-variance; none rejected (default)\n"
 "    --soft_weight_floor F    minimum per-observation QEM weight in soft mode (default 0.02)\n"
 "    --min_hit_weight_vertex F  min accumulated hit weight for a confirmed surface vertex (0=auto: 0.5*min_hit_count_vertex in soft mode)\n"
+"    --soft_carve_min_weight F  below this confidence, ray carving is reduced (default 0.10)\n"
+"    --soft_carve_skip_weight F below this confidence, no ray carving (default 0.03)\n"
+"    --soft_miss_weight_scale F reduced-carve multiplier for weak hits (default 0.10)\n"
+"    --soft_ray_normal_weight F confidence cap for ray-direction fallback normals (default 0.005)\n"
 "    --process_every_n N      input subsampling factor (default 2)\n"
 "    --estimate_normals_k N   k for PCA fallback (default 20)\n"
 "    --disable_nvt           disable NVT/BEO normal denoising\n"
@@ -8202,6 +8256,10 @@ int main(int argc, char** argv) {
         else if (arg == "--enable_soft_uncertainty_weighting")  settings.soft_uncertainty_weighting = true;
         else if (arg == "--disable_soft_uncertainty_weighting") settings.soft_uncertainty_weighting = false;
         else if (arg == "--soft_weight_floor")    settings.soft_weight_floor    = argv_util::next_double(arg);
+        else if (arg == "--soft_carve_min_weight")  settings.soft_carve_min_weight  = argv_util::next_double(arg);
+        else if (arg == "--soft_carve_skip_weight") settings.soft_carve_skip_weight = argv_util::next_double(arg);
+        else if (arg == "--soft_miss_weight_scale") settings.soft_miss_weight_scale = argv_util::next_double(arg);
+        else if (arg == "--soft_ray_normal_weight") settings.soft_ray_normal_weight = argv_util::next_double(arg);
         else if (arg == "--process_every_n")      settings.process_every_n      = argv_util::next_int(arg);
         else if (arg == "--estimate_normals_k")   settings.estimate_normals_k   = argv_util::next_int(arg);
         else if (arg == "--disable_nvt")          settings.enable_nvt           = false;
@@ -8592,6 +8650,11 @@ int main(int argc, char** argv) {
     std::printf("  Vertex gate: count>=%d  weight>=%.3f%s\n",
                 settings.min_hit_count_vertex, settings.min_hit_weight_vertex,
                 settings.min_hit_weight_vertex > 0.0 ? "" : "  (weight gate disabled)");
+    if (settings.soft_uncertainty_weighting)
+        std::printf("  Soft carve: full>=%.3f reduced(%.3f..%.3f)*%.2f skip<%.3f  ray_normal_conf_cap=%.3f\n",
+                    settings.soft_carve_min_weight, settings.soft_carve_skip_weight,
+                    settings.soft_carve_min_weight, settings.soft_miss_weight_scale,
+                    settings.soft_carve_skip_weight, settings.soft_ray_normal_weight);
     std::printf("  Probabilistic planes: %s bearing_sigma=%.6f pose_trans_sigma=%.4f pose_rot_sigma=%.6f gate_sigma=%.2f sigma=[%.3f, %.3f] qem_ref=%.4f sample_cap=50\n",
                 settings.enable_probabilistic_planes ? "on" : "off",
                 settings.bearing_sigma_rad, settings.pose_trans_sigma, settings.pose_rot_sigma_rad,
