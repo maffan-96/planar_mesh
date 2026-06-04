@@ -355,6 +355,22 @@ struct Settings {
     // re-mesh, so triangles straddling the dirty/clean seam reconnect to their
     // clean neighbors. 0 = auto-derive from the active mesh edge factors.
     int         persistent_mesh_halo_voxels = 0;
+    // Seam-aware hole closing. After the dirty region is spliced into the
+    // persistent mesh, run a PlanarMesh-style angular hole-closing pass over the
+    // boundary vertices that sit on the persistent<->local seam. Unlike the
+    // smooth mesher, this pass synthesizes the bridging edge needed to close a
+    // cavity, so holes that straddle the incremental seam are closed the way a
+    // single live mesh would close them.
+    bool        enable_seam_closing = true;
+    int         seam_close_iters    = 2;     // cascade passes (a closed triangle can expose the next)
+    // Sparse-region scaffold structuring. Where raw LiDAR points are too sparse
+    // to fill voxels at the working resolution, inherit a coarse-level QEM plane
+    // / normal / evidence into the empty fine voxels ("virtual inherited points")
+    // so the mesher has vertices to connect. Turning this on enables the
+    // hierarchical scaffold inheritance + fill machinery and (unless the user
+    // picked a mesh_mode explicitly) selects corner_dc_plus so the scaffold fill
+    // pass can emit faces.
+    bool        sparse_region_scaffold = true;
     bool        dc_require_free  = true;     // only create quads on observed surface/free interfaces
     double      dc_normal_dot    = 0.50;     // looser than smooth mode: allows curves and creases
     double      dc_max_edge_factor = 2.50;   // max quad triangle edge / voxel_size
@@ -3259,6 +3275,26 @@ public:
                 double d = 0.0;
                 if (!scaffold_parent_plane(level, pk, a, n, d, x)) continue;
                 level_parents++;
+
+                // A parent is "active" this scan if any of its children received
+                // a hit this scan. Only active parents propagate dirtiness to
+                // their inherited children, so a stable scaffold region is not
+                // re-meshed every export -- this keeps the persistent incremental
+                // mesher bounded while still re-solving sparse cells whose
+                // underlying surface actually moved.
+                bool parent_active = false;
+                for (int dx = 0; dx < factor && !parent_active; ++dx)
+                for (int dy = 0; dy < factor && !parent_active; ++dy)
+                for (int dz = 0; dz < factor && !parent_active; ++dz) {
+                    VoxKey ck{(int32_t)(pk.i * factor + dx),
+                              (int32_t)(pk.j * factor + dy),
+                              (int32_t)(pk.k * factor + dz)};
+                    auto cit = cells.find(ck);
+                    if (cit != cells.end() && cit->second.hit_count > 0 &&
+                        cit->second.last_hit_scan == scan_idx)
+                        parent_active = true;
+                }
+
                 for (int dx = 0; dx < factor; ++dx)
                 for (int dy = 0; dy < factor; ++dy)
                 for (int dz = 0; dz < factor; ++dz) {
@@ -3276,7 +3312,7 @@ public:
                     VoxelCell& child = cells[ck];
                     child.add_inherited_plane(p, n, w, scan_idx, level, decay_ref);
                     scaffold_inherited_keys.insert(ck);
-                    mark_component_dirty(ck);
+                    if (parent_active) mark_component_dirty(ck);
                     level_children++;
                 }
             }
@@ -3670,6 +3706,15 @@ public:
         n_seed_promoted_total += n_promoted;
         n_seed_l1_parent_supported_total += n_l1_promoted;
         scan_count = std::max(scan_count, scan_idx + 1);
+
+        // Sparse-region scaffold structuring: inherit coarse-level QEM planes /
+        // normals / evidence into empty fine voxels so sparse areas get virtual
+        // vertices to mesh. Rebuilt incrementally per scan (only active parents
+        // re-dirty their children, so stable scaffold is not re-meshed). Done
+        // after this scan's hits/promotions are merged so parents see fresh
+        // child evidence.
+        if (hierarchical_scaffold_enabled())
+            rebuild_hierarchical_scaffold_inheritance(scan_idx);
 
         long n_boundary = 0;
         if (have_scanline) for (const auto& si : scan_info) if (si.valid && si.boundary) n_boundary++;
@@ -5410,6 +5455,9 @@ public:
                               (int32_t)(pk.k * factor + dz)};
 
                     if (idx_by_key.find(ck) != idx_by_key.end()) continue; // real/L1 scaffold wins
+                    // Keep scaffold fill local during a persistent incremental
+                    // remesh: only tile child cells inside the active region.
+                    if (active_region_ && active_region_->find(ck) == active_region_->end()) continue;
                     if (!scaffold_child_visibility_ok(ck)) continue;
 
                     Vec3 ctr = voxel_center(ck);
@@ -6880,6 +6928,20 @@ public:
         } else {
             mesh = build_local_smooth_mesh(min_last_hit_scan, max_last_hit_scan);
         }
+
+        // Sparse-region scaffold fill for modes that do not run it internally.
+        // corner_dc_plus / hybrid / component_growth already invoke the fill pass
+        // inside build_corner_dc_plus_mesh; the remaining modes (smooth, dual,
+        // corner_dc, surface_net) need it appended so inherited (virtual) vertices
+        // in sparse regions get tiled into faces regardless of the chosen mode.
+        const bool mode_runs_fill_internally =
+            (mode == "corner_dc_plus" || mode == "cornerdc_plus" || mode == "corner_plus" || mode == "cdp" ||
+             mode == "component_growth" || mode == "component_grow" || mode == "grow" || mode == "hybrid");
+        if (hierarchical_scaffold_fill_enabled() && !mode_runs_fill_internally && mesh.verts.size() >= 1) {
+            std::unordered_set<FaceKey, FaceKeyHash> fset;
+            rebuild_face_set_from_mesh(mesh, fset);
+            apply_hierarchical_scaffold_fill_pass(mesh, fset);
+        }
         return mesh;
     }
 
@@ -7042,15 +7104,129 @@ public:
 
         persistent_mesh_ = std::move(merged);
         persistent_mesh_update_count++;
+
+        // Seam-aware hole closing across the persistent<->local boundary.
+        size_t seam_closed = 0;
+        if (s.enable_seam_closing) seam_closed = close_seam_holes(persistent_mesh_, region);
+
         std::printf("  [persistent_mesh] update #%ld: dirty=%zu region=%zu halo=%d "
                     "local(v=%zu,f=%zu) kept_clean=%zu remeshed=%zu retained_dirty=%zu retired=%zu "
-                    "-> mesh(v=%zu,f=%zu)\n",
+                    "seam_closed=%zu -> mesh(v=%zu,f=%zu)\n",
                     persistent_mesh_update_count, dirty.size(), region.size(), halo,
                     local.verts.size(), local.faces.size(), kept, remeshed, retained_dirty, retired,
-                    persistent_mesh_.verts.size(), persistent_mesh_.faces.size());
+                    seam_closed, persistent_mesh_.verts.size(), persistent_mesh_.faces.size());
 
         dirty_component_voxel_keys.clear();
         mesh_free_carve_pending_ = false;
+    }
+
+    // PlanarMesh-style angular hole closing restricted to the persistent<->local
+    // seam. For each boundary vertex whose voxel key lies in the freshly meshed
+    // region, gather its boundary-edge neighbors, project them into the vertex
+    // tangent plane, angle-sort them, and close every sufficiently small angular
+    // gap by adding the triangle (v, n_i, n_{i+1}) -- synthesizing the bridging
+    // edge n_i--n_{i+1}. A manifold edge-incidence guard means a gap is only
+    // closed when both of its edges still have a free face slot, so this can fill
+    // holes but never create a non-manifold seam. Cascaded over a few iterations
+    // because closing one triangle can expose the next gap.
+    size_t close_seam_holes(MeshData& mesh,
+                            const std::unordered_set<VoxKey, VoxHash>& region) const {
+        if (mesh.verts.size() < 3 || mesh.faces.empty()) return 0;
+        const double max_edge = std::max(s.mesh_max_edge_factor, s.cdp_max_edge_factor) * s.voxel_size;
+        const double max_fan_angle = std::clamp(s.mesh_max_fan_angle, 0.1, 6.283185307179586);
+        const int iters = std::max(1, s.seam_close_iters);
+
+        size_t total_added = 0;
+        for (int iter = 0; iter < iters; ++iter) {
+            const int N = (int)mesh.verts.size();
+
+            // Edge incidence + current triangle set.
+            std::unordered_map<uint64_t, int> edge_count;
+            edge_count.reserve(mesh.faces.size() * 3 + 1);
+            std::unordered_set<FaceKey, FaceKeyHash> face_set;
+            face_set.reserve(mesh.faces.size() * 2 + 16);
+            for (const auto& f : mesh.faces) {
+                if (f.a < 0 || f.b < 0 || f.c < 0 || f.a >= N || f.b >= N || f.c >= N) continue;
+                edge_count[edge_key(f.a, f.b)]++;
+                edge_count[edge_key(f.b, f.c)]++;
+                edge_count[edge_key(f.c, f.a)]++;
+                face_set.insert(sorted_face_key(f.a, f.b, f.c));
+            }
+
+            // Boundary neighbors: endpoints joined by a once-used (boundary) edge.
+            std::unordered_map<int, std::vector<int>> bnbr;
+            for (const auto& kv : edge_count) {
+                if (kv.second != 1) continue;
+                int a = (int)(kv.first >> 32), b = (int)(kv.first & 0xffffffffu);
+                if (a < 0 || b < 0 || a >= N || b >= N) continue;
+                bnbr[a].push_back(b);
+                bnbr[b].push_back(a);
+            }
+            if (bnbr.empty()) break;
+
+            size_t added_iter = 0;
+            for (auto& kv : bnbr) {
+                int vi = kv.first;
+                // Only work the seam: the freshly re-meshed neighborhood.
+                if (region.find(mesh.verts[vi].key) == region.end()) continue;
+                std::vector<int>& nbrs = kv.second;
+                if (nbrs.size() < 2) continue;
+
+                Vec3 nv = mesh.verts[vi].normal;
+                if (!normalized_or_zero(nv)) continue;
+                Vec3 ref = (std::abs(nv.z()) < 0.9) ? Vec3(0, 0, 1) : Vec3(1, 0, 0);
+                Vec3 u = ref.cross(nv); if (!normalized_or_zero(u)) continue;
+                Vec3 w = nv.cross(u);   if (!normalized_or_zero(w)) continue;
+
+                struct AN { double ang; int idx; };
+                std::vector<AN> ring;
+                ring.reserve(nbrs.size());
+                for (int j : nbrs) {
+                    Vec3 d = mesh.verts[j].position - mesh.verts[vi].position;
+                    double x = d.dot(u), y = d.dot(w);
+                    if (x * x + y * y < 1e-18) continue;
+                    ring.push_back({std::atan2(y, x), j});
+                }
+                if (ring.size() < 2) continue;
+                std::sort(ring.begin(), ring.end(), [](const AN& a, const AN& b){ return a.ang < b.ang; });
+
+                int K = (int)ring.size();
+                for (int t = 0; t < K; ++t) {
+                    int j = ring[t].idx;
+                    int k = ring[(t + 1) % K].idx;
+                    if (j == k || j == vi || k == vi) continue;
+                    double gap = ring[(t + 1) % K].ang - ring[t].ang;
+                    if (t + 1 == K) gap += 6.283185307179586;
+                    if (gap > max_fan_angle) continue;
+
+                    // Geometry / QEM gates (reuse the smooth mesher's triangle test).
+                    if ((mesh.verts[vi].position - mesh.verts[j].position).norm() > max_edge) continue;
+                    if ((mesh.verts[vi].position - mesh.verts[k].position).norm() > max_edge) continue;
+                    if ((mesh.verts[j].position  - mesh.verts[k].position).norm() > max_edge) continue;
+                    if (!mesh_triangle_ok(mesh.verts[vi], mesh.verts[j], mesh.verts[k])) continue;
+
+                    // Manifold guard: only close if both bridged edges have a slot.
+                    if (!triangle_edges_can_accept(edge_count, vi, j, k)) continue;
+
+                    FaceKey fk = sorted_face_key(vi, j, k);
+                    if (face_set.find(fk) != face_set.end()) continue;
+
+                    // Orient against the averaged vertex normal.
+                    int fa = vi, fb = j, fc = k;
+                    Vec3 tri_n = (mesh.verts[fb].position - mesh.verts[fa].position)
+                               .cross(mesh.verts[fc].position - mesh.verts[fa].position);
+                    if (normalized_or_zero(nv) && tri_n.dot(nv) < 0.0) std::swap(fb, fc);
+
+                    mesh.faces.push_back({fa, fb, fc});
+                    face_set.insert(fk);
+                    register_triangle_edges(edge_count, fa, fb, fc);
+                    added_iter++;
+                }
+            }
+            total_added += added_iter;
+            if (added_iter == 0) break;
+        }
+        return total_added;
     }
 
     MeshData build_mesh_for_mode(int min_last_hit_scan = -1,
@@ -7689,6 +7865,11 @@ static void print_usage() {
 "    --disable_persistent_mesh   rebuild the whole mesh from scratch on every export (old behavior)\n"
 "    --enable_persistent_mesh    PlanarMesh-style: keep one mesh, remesh only dirty voxel regions (default on)\n"
 "    --persistent_mesh_halo_voxels N   halo (voxels) re-meshed around the dirty region; 0=auto (default)\n"
+"    --disable_seam_closing      do not run the seam-aware hole-closing pass after each incremental splice\n"
+"    --enable_seam_closing       close holes across the persistent<->local seam (default on)\n"
+"    --seam_close_iters N        cascade passes for seam hole closing (default 2)\n"
+"    --disable_sparse_scaffold   do not inherit virtual QEM/evidence into sparse voxels (manage --scaffold_* manually)\n"
+"    --enable_sparse_scaffold    scaffold sparse regions with inherited coarse-level QEM planes (default on)\n"
 "                              smooth         = local fan triangulation on smooth patches\n"
 "                              dual / dc      = grid-edge DC, cell-labelled\n"
 "                              corner_dc      = corner-sign DC; higher recall than dual\n"
@@ -7887,6 +8068,11 @@ int main(int argc, char** argv) {
         else if (arg == "--enable_persistent_mesh")  settings.persistent_incremental_mesh = true;
         else if (arg == "--disable_persistent_mesh") settings.persistent_incremental_mesh = false;
         else if (arg == "--persistent_mesh_halo_voxels") settings.persistent_mesh_halo_voxels = argv_util::next_int(arg);
+        else if (arg == "--enable_seam_closing")  settings.enable_seam_closing = true;
+        else if (arg == "--disable_seam_closing") settings.enable_seam_closing = false;
+        else if (arg == "--seam_close_iters")     settings.seam_close_iters     = argv_util::next_int(arg);
+        else if (arg == "--enable_sparse_scaffold")  settings.sparse_region_scaffold = true;
+        else if (arg == "--disable_sparse_scaffold") settings.sparse_region_scaffold = false;
         else if (arg == "--dc_require_free")      settings.dc_require_free      = true;
         else if (arg == "--dc_no_require_free")   settings.dc_require_free      = false;
         else if (arg == "--dc_normal_dot")        settings.dc_normal_dot        = argv_util::next_double(arg);
@@ -8119,6 +8305,18 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "  [WARN] PandarQT64 design table has 64 channels; --pandar_qt64_channels is ignored unless using --pandar_qt64_calib, --pandar_qt64_uniform, or --pandar_qt64_infer.\n");
     }
 
+    // Sparse-region scaffold structuring: turn on the hierarchical scaffold
+    // inheritance + fill machinery so voxels too sparse to be filled by raw
+    // points at the working resolution receive virtual inherited QEM planes /
+    // normals / evidence from a coarse level. Power users who want manual
+    // control over the scaffold flags can pass --disable_sparse_scaffold and
+    // configure --enable_hierarchical_scaffold / --scaffold_* directly.
+    if (settings.sparse_region_scaffold) {
+        settings.enable_hierarchical_scaffold = true;       // inherit coarse QEM into sparse cells
+        settings.enable_hierarchical_scaffold_fill = true;  // tile inherited cells into faces
+        if (settings.scaffold_max_level < 1) settings.scaffold_max_level = 2;
+    }
+
     int n_threads = 1;
     #ifdef HAS_OPENMP
     n_threads = omp_get_max_threads();
@@ -8182,6 +8380,10 @@ int main(int argc, char** argv) {
     std::printf("  Persistent incremental mesh: %s  halo_voxels=%s\n",
                 settings.persistent_incremental_mesh ? "on (remesh dirty regions only)" : "off (full rebuild each export)",
                 halo_desc.c_str());
+    std::printf("  Seam-aware hole closing: %s  iters=%d\n",
+                settings.enable_seam_closing ? "on" : "off", settings.seam_close_iters);
+    std::printf("  Sparse-region scaffold: %s  (virtual inherited QEM/evidence into sparse voxels, max_level=%d)\n",
+                settings.sparse_region_scaffold ? "on" : "off", settings.scaffold_max_level);
     std::printf("  Component growth: %s iters=%d edge=%.2f radius=%.2f/%.2f normal_dot=%.2f comp_dot=%.2f plane=%.2f confirmed_anchor=%s persistent=%s dirty_only=%s dirty_rad=%d search=%s\n",
                 settings.enable_component_growth ? "on" : "off",
                 settings.component_growth_iters,
