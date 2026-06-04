@@ -202,6 +202,13 @@ struct Settings {
     double thresh_free           = -0.50;   // occupancy_score <= this -> free
     int    min_evidence          = 2;       // hits + misses needed to label
     int    min_hit_count_vertex  = 2;       // min hits to extract a vertex
+    // Minimum accumulated confidence (sum of soft hit weights) for a cell to be
+    // exported as a confirmed surface vertex. Complements min_hit_count_vertex
+    // so that, under soft uncertainty weighting, a cell backed only by weak /
+    // grazing returns (many low-weight hits) does not become a confident vertex.
+    // 0 = disabled (pure count gate). When soft weighting is enabled and this is
+    // left at 0, main() auto-sets it to 0.5 * min_hit_count_vertex.
+    double min_hit_weight_vertex = 0.0;
 
     // Weak/seed voxel layer. These are real LiDAR endpoint observations that
     // are too weak/sparse/grazing to become ordinary surface voxels yet. They
@@ -1155,6 +1162,15 @@ struct VoxelCell {
     int confirmed_hit_count() const {
         int weak = std::max(0, promoted_seed_count);
         return std::max(0, hit_count - weak);
+    }
+
+    // Total confidence (sum of soft per-observation weights) backing this cell,
+    // excluding promoted-seed weight. Under soft uncertainty weighting this is
+    // the quantity to gate vertex export on: a cell supported only by weak /
+    // grazing returns accumulates little weight even if it has many hits.
+    double confirmed_hit_weight() const {
+        double weak = std::max(0.0, promoted_seed_weight);
+        return std::max(0.0, hit_weight - weak);
     }
 
     int confidence_tier() const {
@@ -3936,9 +3952,17 @@ public:
         int confidence_tier; // 0=confirmed, 1=weak_promoted, 2=parent_supported, 4=generated, 6=inherited
     };
 
+    // A cell is a confirmed surface vertex when it is surface-labelled and has
+    // both enough observations (count gate) and enough accumulated confidence
+    // (weight gate). The weight gate is a no-op when min_hit_weight_vertex == 0.
+    bool cell_is_confirmed_surface(const VoxelCell& v) const {
+        return v.label(s) == VoxelCell::Label::SURFACE &&
+               v.confirmed_hit_count()  >= s.min_hit_count_vertex &&
+               v.confirmed_hit_weight() >= s.min_hit_weight_vertex;
+    }
+
     int cell_vertex_tier(const VoxelCell& v) const {
-        if (v.label(s) == VoxelCell::Label::SURFACE &&
-            v.confirmed_hit_count() >= s.min_hit_count_vertex) return 0;
+        if (cell_is_confirmed_surface(v)) return 0;
         if (v.parent_supported_seed_count > 0) return 2;
         if (v.promoted_seed_count > 0) return 1;
         if (hierarchical_scaffold_enabled() && v.has_inherited()) return 6;
@@ -3946,8 +3970,7 @@ public:
     }
 
     bool cell_vertex_export_ok(const VoxelCell& v) const {
-        if (v.label(s) == VoxelCell::Label::SURFACE &&
-            v.confirmed_hit_count() >= s.min_hit_count_vertex) return true;
+        if (cell_is_confirmed_surface(v)) return true;
         if (hierarchical_scaffold_enabled() && v.has_inherited()) {
             if (v.label(s) == VoxelCell::Label::FREE) return false;
             if (s.enable_eogm && (v.eogm_bel_free() > s.scaffold_max_bel_free ||
@@ -7905,6 +7928,7 @@ static void print_usage() {
 "    --disable_soft_uncertainty_weighting   reject grazing returns / use the seed-building path instead of soft weighting\n"
 "    --enable_soft_uncertainty_weighting    use every observation, weighted by confidence/inverse-variance; none rejected (default)\n"
 "    --soft_weight_floor F    minimum per-observation QEM weight in soft mode (default 0.02)\n"
+"    --min_hit_weight_vertex F  min accumulated hit weight for a confirmed surface vertex (0=auto: 0.5*min_hit_count_vertex in soft mode)\n"
 "    --process_every_n N      input subsampling factor (default 2)\n"
 "    --estimate_normals_k N   k for PCA fallback (default 20)\n"
 "    --disable_nvt           disable NVT/BEO normal denoising\n"
@@ -8225,6 +8249,7 @@ int main(int argc, char** argv) {
         else if (arg == "--thresh_free")          settings.thresh_free          = argv_util::next_double(arg);
         else if (arg == "--min_evidence")         settings.min_evidence         = argv_util::next_int(arg);
         else if (arg == "--min_hit_count_vertex") settings.min_hit_count_vertex = argv_util::next_int(arg);
+        else if (arg == "--min_hit_weight_vertex") settings.min_hit_weight_vertex = argv_util::next_double(arg);
         else if (arg == "--disable_seed_voxels")  settings.enable_seed_voxels   = false;
         else if (arg == "--enable_seed_voxels")   settings.enable_seed_voxels   = true;
         else if (arg == "--seed_min_incident_cos") settings.seed_min_incident_cos = argv_util::next_double(arg);
@@ -8541,6 +8566,13 @@ int main(int argc, char** argv) {
         settings.scaffold_inherit_into_real_cells = true;   // redistribute to all 8 children
     }
 
+    // Under soft uncertainty weighting, enforce the confidence principle at the
+    // vertex gate too: a cell needs enough accumulated weight, not just enough
+    // raw hits. Auto-pick a threshold tied to the count gate if not set.
+    if (settings.soft_uncertainty_weighting && settings.min_hit_weight_vertex <= 0.0) {
+        settings.min_hit_weight_vertex = 0.5 * (double)std::max(1, settings.min_hit_count_vertex);
+    }
+
     int n_threads = 1;
     #ifdef HAS_OPENMP
     n_threads = omp_get_max_threads();
@@ -8557,6 +8589,9 @@ int main(int argc, char** argv) {
                 settings.soft_uncertainty_weighting ? "on" : "off",
                 settings.soft_weight_floor,
                 settings.soft_uncertainty_weighting ? "" : "  [grazing rejected at min_incident_cos; weak returns go to seed map]");
+    std::printf("  Vertex gate: count>=%d  weight>=%.3f%s\n",
+                settings.min_hit_count_vertex, settings.min_hit_weight_vertex,
+                settings.min_hit_weight_vertex > 0.0 ? "" : "  (weight gate disabled)");
     std::printf("  Probabilistic planes: %s bearing_sigma=%.6f pose_trans_sigma=%.4f pose_rot_sigma=%.6f gate_sigma=%.2f sigma=[%.3f, %.3f] qem_ref=%.4f sample_cap=50\n",
                 settings.enable_probabilistic_planes ? "on" : "off",
                 settings.bearing_sigma_rad, settings.pose_trans_sigma, settings.pose_rot_sigma_rad,
