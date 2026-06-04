@@ -16,8 +16,14 @@
  *   3. Sensor origin in global frame = t
  *   4. Subsample (process_every_n), fill in missing normals via spatial PCA
  *   5. Orient normals toward the sensor (sign consistency)
- *   6. Compute per-point LiDAR weights = cos^2(incidence)
- *   7. Drop grazing returns (incident_cos < min_incident_cos)
+ *   6. Compute per-point LiDAR weights = cos^2(incidence) * normal_conf *
+ *      inverse along-normal variance (n^T Sigma n) from the range+bearing+pose
+ *      covariance.
+ *   7. Soft uncertainty weighting (default): every observation contributes to
+ *      the QEM map weighted by that confidence -- none are rejected. With
+ *      --disable_soft_uncertainty_weighting the legacy path is used instead:
+ *      drop grazing returns (incident_cos < min_incident_cos) / divert weak
+ *      returns to the seed map.
  *   8. OpenMP-parallel ingest: each thread accumulates hits and ray-carved
  *      misses into a thread-local voxel map. Serial merge folds the
  *      thread-local maps into the master.
@@ -138,7 +144,17 @@ struct Settings {
     double prob_gate_min_factor   = 0.50;   // adaptive gate cannot tighten below base*this
     double prob_gate_max_factor   = 3.00;   // adaptive gate cannot relax above base*this
     double prob_planar_eigen_thresh = 0.0;  // <=0 uses 0.25*voxel_size^2
-    double min_incident_cos      = 0.30;    // reject grazing (|n.dir| < this)
+    double min_incident_cos      = 0.30;    // reject grazing (|n.dir| < this) -- only used when soft weighting is OFF
+    // Soft uncertainty weighting (default). Instead of rejecting grazing/low-
+    // confidence returns or diverting them to the seed/hypothesis map, EVERY
+    // observation contributes to the main QEM map with a weight proportional to
+    // its confidence: incidence (inc_cos^2), normal-estimate confidence, and the
+    // inverse along-normal variance from the full range+bearing+pose covariance
+    // (n^T Sigma n). Confident observations contribute more, grazing/uncertain
+    // ones contribute less, but none are discarded. A small floor keeps even
+    // near-tangent returns contributing a little rather than nothing.
+    bool   soft_uncertainty_weighting = true;
+    double soft_weight_floor          = 0.02;   // minimum per-observation QEM weight (never 0 -> never rejected)
     int    process_every_n       = 2;       // subsample factor per scan
     int    estimate_normals_k    = 20;      // k for PCA fallback
     bool   orient_to_sensor      = true;    // flip normals to face sensor
@@ -3689,6 +3705,16 @@ public:
                 ? probabilistic_qem_weight_scale(n, point_cov_w[i], s)
                 : 1.0;
             double base_weight = inc_cos * inc_cos * nc_soft * prob_scale;
+            if (s.soft_uncertainty_weighting) {
+                // Uncertainty-weighted fusion: use every observation, weighted by
+                // confidence. No grazing rejection and no seed/hypothesis
+                // diversion -- low-confidence returns simply get a small weight
+                // and therefore move the QEM vertex/plane very little. The floor
+                // guarantees nothing is effectively discarded.
+                weights[i] = std::max(base_weight, s.soft_weight_floor);
+                keep[i] = 1; // always a main-map confirmed hit
+                continue;
+            }
             if (s.enable_seed_voxels && s.seed_ray_normal_fallback && normal_source[i] == 3) {
                 // A ray-direction normal is only a fallback placeholder; keep
                 // the endpoint as a hypothesis until region evidence validates it.
@@ -7875,7 +7901,10 @@ static void print_usage() {
 "    --prob_qem_ref_sigma F  reference sigma for inverse-variance QEM weights\n"
 "    --prob_min_sigma F      lower clamp for probabilistic sigma, metres\n"
 "    --prob_max_sigma F      upper clamp for probabilistic sigma, metres\n"
-"    --min_incident_cos F     grazing threshold |n.dir| (default 0.30)\n"
+"    --min_incident_cos F     grazing threshold |n.dir| (default 0.30; only used with --disable_soft_uncertainty_weighting)\n"
+"    --disable_soft_uncertainty_weighting   reject grazing returns / use the seed-building path instead of soft weighting\n"
+"    --enable_soft_uncertainty_weighting    use every observation, weighted by confidence/inverse-variance; none rejected (default)\n"
+"    --soft_weight_floor F    minimum per-observation QEM weight in soft mode (default 0.02)\n"
 "    --process_every_n N      input subsampling factor (default 2)\n"
 "    --estimate_normals_k N   k for PCA fallback (default 20)\n"
 "    --disable_nvt           disable NVT/BEO normal denoising\n"
@@ -8146,6 +8175,9 @@ int main(int argc, char** argv) {
         else if (arg == "--prob_gate_max_factor") settings.prob_gate_max_factor = argv_util::next_double(arg);
         else if (arg == "--prob_planar_eigen_thresh") settings.prob_planar_eigen_thresh = argv_util::next_double(arg);
         else if (arg == "--min_incident_cos")     settings.min_incident_cos     = argv_util::next_double(arg);
+        else if (arg == "--enable_soft_uncertainty_weighting")  settings.soft_uncertainty_weighting = true;
+        else if (arg == "--disable_soft_uncertainty_weighting") settings.soft_uncertainty_weighting = false;
+        else if (arg == "--soft_weight_floor")    settings.soft_weight_floor    = argv_util::next_double(arg);
         else if (arg == "--process_every_n")      settings.process_every_n      = argv_util::next_int(arg);
         else if (arg == "--estimate_normals_k")   settings.estimate_normals_k   = argv_util::next_int(arg);
         else if (arg == "--disable_nvt")          settings.enable_nvt           = false;
@@ -8521,6 +8553,10 @@ int main(int argc, char** argv) {
                 settings.voxel_size, settings.range_precision,
                 settings.min_incident_cos, settings.process_every_n,
                 settings.carve_rays ? "yes" : "no");
+    std::printf("  Soft uncertainty weighting: %s  (every observation used; weight = inc_cos^2 * normal_conf * inverse-variance; floor=%.3f)%s\n",
+                settings.soft_uncertainty_weighting ? "on" : "off",
+                settings.soft_weight_floor,
+                settings.soft_uncertainty_weighting ? "" : "  [grazing rejected at min_incident_cos; weak returns go to seed map]");
     std::printf("  Probabilistic planes: %s bearing_sigma=%.6f pose_trans_sigma=%.4f pose_rot_sigma=%.6f gate_sigma=%.2f sigma=[%.3f, %.3f] qem_ref=%.4f sample_cap=50\n",
                 settings.enable_probabilistic_planes ? "on" : "off",
                 settings.bearing_sigma_rad, settings.pose_trans_sigma, settings.pose_rot_sigma_rad,
