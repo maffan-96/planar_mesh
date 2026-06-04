@@ -8498,7 +8498,15 @@ int main(int argc, char** argv) {
     if (settings.sparse_region_scaffold) {
         settings.enable_hierarchical_scaffold = true;       // inherit coarse QEM into sparse cells
         settings.enable_hierarchical_scaffold_fill = true;  // tile inherited cells into faces
-        if (settings.scaffold_max_level < 1) settings.scaffold_max_level = 2;
+        // Singular scaffold: exactly one fallback level at 2x the voxel size
+        // (0.1 m voxel -> 0.2 m parent, 2^3 = 8 children). When a 0.1 m voxel
+        // lacks evidence, the 0.2 m parent's QEM/plane is redistributed to all 8
+        // children; children that later accumulate real hits override the
+        // inherited QEM (via inherited_decay_scale), while un-updated children
+        // keep the inherited QEM. No coarser (0.4 m+) levels are used.
+        settings.scaffold_base_factor = 2;
+        settings.scaffold_max_level   = 1;
+        settings.scaffold_inherit_into_real_cells = true;   // redistribute to all 8 children
     }
 
     int n_threads = 1;
@@ -8567,8 +8575,12 @@ int main(int argc, char** argv) {
     std::printf("  Seam-aware hole closing: %s  iters=%d  retire_free_faces=%s\n",
                 settings.enable_seam_closing ? "on" : "off", settings.seam_close_iters,
                 settings.persistent_retire_free_faces ? "on" : "off");
-    std::printf("  Sparse-region scaffold: %s  (virtual inherited QEM/evidence into sparse voxels, max_level=%d)\n",
-                settings.sparse_region_scaffold ? "on" : "off", settings.scaffold_max_level);
+    std::printf("  Sparse-region scaffold: %s  singular fallback @ %.3fm (=%dx voxel, %d children), max_level=%d\n",
+                settings.sparse_region_scaffold ? "on" : "off",
+                settings.voxel_size * settings.scaffold_base_factor,
+                settings.scaffold_base_factor,
+                settings.scaffold_base_factor * settings.scaffold_base_factor * settings.scaffold_base_factor,
+                settings.scaffold_max_level);
     std::printf("  Component growth: %s iters=%d edge=%.2f radius=%.2f/%.2f normal_dot=%.2f comp_dot=%.2f plane=%.2f confirmed_anchor=%s persistent=%s dirty_only=%s dirty_rad=%d search=%s\n",
                 settings.enable_component_growth ? "on" : "off",
                 settings.component_growth_iters,
