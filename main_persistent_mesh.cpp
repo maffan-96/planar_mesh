@@ -3345,6 +3345,136 @@ public:
         return total_children;
     }
 
+    // Aggregate the QEM/normal/evidence of all source-ok children inside one
+    // coarse parent block. O(factor^3) instead of O(all cells); used by the
+    // incremental inheritance rebuild so per-scan cost scales with the scan
+    // footprint, not the whole map.
+    ScaffoldAggregate build_scaffold_aggregate_for_parent(int level, const VoxKey& pk) const {
+        ScaffoldAggregate a;
+        const int factor = scaffold_factor_for_level(level);
+        for (int dx = 0; dx < factor; ++dx)
+        for (int dy = 0; dy < factor; ++dy)
+        for (int dz = 0; dz < factor; ++dz) {
+            VoxKey ck{(int32_t)(pk.i * factor + dx),
+                      (int32_t)(pk.j * factor + dy),
+                      (int32_t)(pk.k * factor + dz)};
+            auto it = cells.find(ck);
+            if (it == cells.end()) continue;
+            const VoxelCell& vc = it->second;
+            if (!scaffold_source_cell_ok(vc)) continue;
+            a.A.noalias() += vc.A;
+            a.b.noalias() += vc.b;
+            a.c += vc.c;
+            a.weight_sum += vc.weight_sum;
+            a.normal_sum.noalias() += vc.normal_sum;
+            a.normal_weight += vc.normal_weight;
+            a.child_count++;
+            a.bel_free_max = std::max(a.bel_free_max, vc.eogm_bel_free());
+            a.conflict_max = std::max(a.conflict_max, vc.eogm_conflict_mass());
+        }
+        return a;
+    }
+
+    // Aggregates restricted to coarse parents that overlap the active region.
+    // Each parent is still summed over its full child block (so a parent
+    // straddling the region edge keeps a correct plane); only parents with no
+    // child in the region are skipped. Keeps the scaffold fill pass O(region)
+    // during a persistent incremental remesh instead of O(all cells).
+    std::unordered_map<VoxKey, ScaffoldAggregate, VoxHash>
+    build_scaffold_aggregates_for_region(int level) const {
+        std::unordered_map<VoxKey, ScaffoldAggregate, VoxHash> agg;
+        if (!active_region_) return agg;
+        std::unordered_set<VoxKey, VoxHash> parents;
+        parents.reserve(active_region_->size());
+        for (const VoxKey& rk : *active_region_) parents.insert(scaffold_parent_key(rk, level));
+        agg.reserve(parents.size() * 2 + 1);
+        for (const VoxKey& pk : parents) {
+            ScaffoldAggregate a = build_scaffold_aggregate_for_parent(level, pk);
+            if (a.child_count > 0) agg.emplace(pk, std::move(a));
+        }
+        return agg;
+    }
+
+    // Incremental scaffold inheritance: only recompute coarse parents whose
+    // children were hit this scan. Stable parents keep their previously inherited
+    // children untouched (and un-dirtied), which is what makes per-scan cost
+    // bounded by the scan footprint. Equivalent in steady state to the full
+    // rebuild restricted to the changed region.
+    long rebuild_hierarchical_scaffold_inheritance_incremental(int scan_idx,
+                                                               const std::vector<VoxKey>& hit_keys) {
+        if (!hierarchical_scaffold_enabled()) {
+            clear_hierarchical_scaffold_inheritance(/*mark_dirty=*/true);
+            return 0;
+        }
+        if (hit_keys.empty()) return 0;
+
+        const int max_level = std::clamp(s.scaffold_max_level, 1, 6);
+        const double base_weight = std::max(1e-12, s.scaffold_inherit_weight);
+        const double level_decay = std::clamp(s.scaffold_inherit_level_decay, 0.01, 1.0);
+        const double decay_ref_scale = std::max(1e-12, s.scaffold_inherit_decay_weight_ref);
+
+        long total_children = 0;
+        for (int level = 1; level <= max_level; ++level) {
+            const int factor = scaffold_factor_for_level(level);
+            const double w = base_weight * std::pow(level_decay, level - 1);
+            const double decay_ref = decay_ref_scale * w;
+
+            // Active parents = coarse blocks containing a cell hit this scan.
+            std::unordered_set<VoxKey, VoxHash> active_parents;
+            active_parents.reserve(hit_keys.size() * 2 + 1);
+            for (const VoxKey& hk : hit_keys) active_parents.insert(scaffold_parent_key(hk, level));
+
+            for (const VoxKey& pk : active_parents) {
+                // 1. Drop this block's previous inheritance and dirty those cells
+                //    (their virtual support is about to change or disappear).
+                for (int dx = 0; dx < factor; ++dx)
+                for (int dy = 0; dy < factor; ++dy)
+                for (int dz = 0; dz < factor; ++dz) {
+                    VoxKey ck{(int32_t)(pk.i * factor + dx),
+                              (int32_t)(pk.j * factor + dy),
+                              (int32_t)(pk.k * factor + dz)};
+                    auto sit = scaffold_inherited_keys.find(ck);
+                    if (sit == scaffold_inherited_keys.end()) continue;
+                    auto cit = cells.find(ck);
+                    if (cit != cells.end()) cit->second.clear_inherited();
+                    scaffold_inherited_keys.erase(sit);
+                    mark_component_dirty(ck);
+                }
+
+                // 2. Recompute the parent plane from the current block evidence.
+                ScaffoldAggregate a = build_scaffold_aggregate_for_parent(level, pk);
+                Vec3 n, x; double d = 0.0;
+                if (!scaffold_parent_plane(level, pk, a, n, d, x)) continue; // support gone -> stays retired
+
+                // 3. Inherit the plane into the empty/sparse children and dirty them.
+                for (int dx = 0; dx < factor; ++dx)
+                for (int dy = 0; dy < factor; ++dy)
+                for (int dz = 0; dz < factor; ++dz) {
+                    VoxKey ck{(int32_t)(pk.i * factor + dx),
+                              (int32_t)(pk.j * factor + dy),
+                              (int32_t)(pk.k * factor + dz)};
+                    auto cit = cells.find(ck);
+                    if (!s.scaffold_inherit_into_real_cells && cit != cells.end() && cit->second.weight_sum > 1e-12)
+                        continue;
+                    if (!scaffold_child_visibility_ok(ck)) continue;
+                    Vec3 ctr = voxel_center(ck);
+                    double reach_scale = 0.5 * s.voxel_size * (std::abs(n[0]) + std::abs(n[1]) + std::abs(n[2]));
+                    if (std::abs(n.dot(ctr) + d) > reach_scale) continue;
+                    Vec3 p = ctr - (n.dot(ctr) + d) * n;
+                    VoxelCell& child = cells[ck];
+                    child.add_inherited_plane(p, n, w, scan_idx, level, decay_ref);
+                    scaffold_inherited_keys.insert(ck);
+                    mark_component_dirty(ck);
+                    total_children++;
+                }
+            }
+        }
+        if (total_children > 0)
+            std::printf("    [hier_scaffold/incr] hit_cells=%zu children_set=%ld (region-local)\n",
+                        hit_keys.size(), total_children);
+        return total_children;
+    }
+
     // ---- Per-scan processing -----------------------------------------------
 
     void process_scan(const PointCloud& pc, const Mat4& pose, int scan_idx) {
@@ -3661,6 +3791,7 @@ public:
         long n_new_cells = 0;
         long n_misses = 0;
         long n_hits = 0;
+        std::vector<VoxKey> this_scan_hit_keys; // drives incremental scaffold inheritance
         for (auto& tm : tls) {
             for (auto& [k, v] : tm) {
                 auto it = cells.find(k);
@@ -3672,7 +3803,7 @@ public:
                 }
                 n_misses += v.miss_count;
                 n_hits   += v.hit_count;
-                if (v.hit_count > 0) mark_component_dirty(k);
+                if (v.hit_count > 0) { mark_component_dirty(k); this_scan_hit_keys.push_back(k); }
                 // Free-space carving (miss-only) does not grow the dirty set, but
                 // it may contradict existing persistent faces; flag a retirement
                 // sweep for the next mesh export.
@@ -3729,12 +3860,11 @@ public:
 
         // Sparse-region scaffold structuring: inherit coarse-level QEM planes /
         // normals / evidence into empty fine voxels so sparse areas get virtual
-        // vertices to mesh. Rebuilt incrementally per scan (only active parents
-        // re-dirty their children, so stable scaffold is not re-meshed). Done
-        // after this scan's hits/promotions are merged so parents see fresh
-        // child evidence.
+        // vertices to mesh. Rebuilt INCREMENTALLY per scan -- only coarse parents
+        // whose children were hit this scan are recomputed -- so the per-scan
+        // cost scales with the scan footprint, not the whole map.
         if (hierarchical_scaffold_enabled())
-            rebuild_hierarchical_scaffold_inheritance(scan_idx);
+            rebuild_hierarchical_scaffold_inheritance_incremental(scan_idx, this_scan_hit_keys);
 
         long n_boundary = 0;
         if (have_scanline) for (const auto& si : scan_info) if (si.valid && si.boundary) n_boundary++;
@@ -5438,7 +5568,10 @@ public:
 
         for (int level = 1; level <= max_level; ++level) {
             const int factor = scaffold_factor_for_level(level);
-            auto agg = build_scaffold_aggregates(level);
+            // During an incremental remesh, only aggregate parents overlapping
+            // the active region; otherwise aggregate the whole map (full build).
+            auto agg = active_region_ ? build_scaffold_aggregates_for_region(level)
+                                      : build_scaffold_aggregates(level);
             if (agg.empty()) continue;
 
             std::unordered_map<VoxKey, int, VoxHash> level_scaffold_idx_by_key;
